@@ -7,3 +7,8 @@ __pycache__/
 app.py.backup
 data_loader.py.backup
 *.backup
+
+# Local SQLite databases
+data/*.db
+data/*.db-shm
+data/*.db-wal
