@@ -5,3 +5,4 @@ __pycache__/
 .DS_Store
 .streamlit/
 app.py.backup
+data_loader.py.backup
