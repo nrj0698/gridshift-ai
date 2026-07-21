@@ -1,0 +1,327 @@
+import plotly.express as px
+import streamlit as st
+
+from carbon_data import generate_demo_forecast
+from scheduler import find_greenest_window
+
+
+st.set_page_config(
+    page_title="GridShift AI",
+    page_icon="🌱",
+    layout="wide",
+)
+
+forecast = generate_demo_forecast(hours=48)
+
+current_intensity = float(
+    forecast.iloc[0]["carbon_intensity"]
+)
+
+st.title("🌱 GridShift AI")
+
+st.subheader(
+    "Carbon-aware scheduling for flexible AI workloads"
+)
+
+st.info(
+    "Tell GridShift how long your AI workload will run and when "
+    "it must finish. GridShift will recommend the lowest-carbon "
+    "continuous execution window."
+)
+
+st.caption(
+    "Prototype mode: this version uses simulated Irish grid data. "
+    "It is not connected to live EirGrid information yet."
+)
+
+st.divider()
+
+st.header("Configure your AI workload")
+
+with st.form("workload_form"):
+    workload_name = st.text_input(
+        "Workload name",
+        value="Train classification model",
+    )
+
+    input_col_1, input_col_2, input_col_3 = st.columns(3)
+
+    with input_col_1:
+        duration_hours = st.number_input(
+            "Workload duration",
+            min_value=1,
+            max_value=24,
+            value=3,
+            step=1,
+            help=(
+                "How many continuous hours the workload "
+                "requires."
+            ),
+        )
+
+    with input_col_2:
+        deadline_hours = st.number_input(
+            "Must finish within",
+            min_value=1,
+            max_value=48,
+            value=12,
+            step=1,
+            help=(
+                "The number of hours from now by which the "
+                "workload must finish."
+            ),
+        )
+
+    with input_col_3:
+        power_watts = st.number_input(
+            "Average workload power",
+            min_value=10,
+            max_value=5000,
+            value=350,
+            step=10,
+            help=(
+                "Estimated average electrical power consumed "
+                "while the workload is running."
+            ),
+        )
+
+    st.caption(
+        "Duration and deadline are measured in hours. "
+        "Power is measured in watts."
+    )
+
+    submitted = st.form_submit_button(
+        "Calculate greenest schedule",
+        type="primary",
+    )
+
+if "schedule_result" not in st.session_state:
+    st.session_state.schedule_result = None
+
+if "scheduled_workload_name" not in st.session_state:
+    st.session_state.scheduled_workload_name = None
+
+if submitted:
+    try:
+        result = find_greenest_window(
+            forecast=forecast,
+            duration_hours=float(duration_hours),
+            deadline_hours=float(deadline_hours),
+            power_watts=float(power_watts),
+        )
+
+        st.session_state.schedule_result = result
+        st.session_state.scheduled_workload_name = (
+            workload_name
+        )
+
+    except ValueError as error:
+        st.session_state.schedule_result = None
+        st.error(str(error))
+
+result = st.session_state.schedule_result
+
+st.divider()
+
+st.header("Scheduling overview")
+
+metric_1, metric_2, metric_3 = st.columns(3)
+
+with metric_1:
+    st.metric(
+        label="Current grid intensity",
+        value=f"{current_intensity:.0f} gCO₂/kWh",
+    )
+
+with metric_2:
+    if result is None:
+        st.metric(
+            label="Recommended start",
+            value="Not calculated",
+        )
+    else:
+        st.metric(
+            label="Recommended start",
+            value=result.start_time.strftime(
+                "%a %H:%M"
+            ),
+        )
+
+with metric_3:
+    if result is None:
+        st.metric(
+            label="Estimated reduction",
+            value="Not calculated",
+        )
+    else:
+        st.metric(
+            label="Estimated reduction",
+            value=(
+                f"{result.reduction_percentage:.1f}%"
+            ),
+        )
+
+st.divider()
+
+st.header("48-hour Irish grid forecast")
+
+figure = px.line(
+    forecast,
+    x="timestamp",
+    y="carbon_intensity",
+    markers=True,
+    labels={
+        "timestamp": "Time",
+        "carbon_intensity": (
+            "Carbon intensity (gCO₂/kWh)"
+        ),
+    },
+)
+
+if result is not None:
+    figure.add_vrect(
+        x0=result.start_time,
+        x1=result.end_time,
+        opacity=0.22,
+        line_width=1,
+        annotation_text="Recommended window",
+        annotation_position="top left",
+    )
+
+    figure.add_scatter(
+        x=[
+            result.start_time,
+            result.end_time,
+        ],
+        y=[
+            result.average_intensity,
+            result.average_intensity,
+        ],
+        mode="markers",
+        name="Scheduled workload",
+    )
+
+figure.update_layout(
+    xaxis_title="Time in Ireland",
+    yaxis_title="Carbon intensity (gCO₂/kWh)",
+    hovermode="x unified",
+    legend_title_text="",
+)
+
+st.plotly_chart(
+    figure,
+    width="stretch",
+    config={
+        "displaylogo": False,
+        "scrollZoom": False,
+    },
+)
+
+if result is not None:
+    st.divider()
+
+    st.header("Recommended schedule")
+
+    st.success(
+        f"GridShift recommends running "
+        f"'{st.session_state.scheduled_workload_name}' from "
+        f"{result.start_time.strftime('%A %d %B at %H:%M')} "
+        f"until {result.end_time.strftime('%H:%M')}."
+    )
+
+    result_col_1, result_col_2 = st.columns(2)
+
+    with result_col_1:
+        st.subheader("Run immediately")
+
+        st.metric(
+            "Average carbon intensity",
+            (
+                f"{result.immediate_average_intensity:.0f} "
+                "gCO₂/kWh"
+            ),
+        )
+
+        st.metric(
+            "Estimated emissions",
+            (
+                f"{result.immediate_emissions_g:.1f} "
+                "gCO₂"
+            ),
+        )
+
+    with result_col_2:
+        st.subheader("GridShift schedule")
+
+        st.metric(
+            "Average carbon intensity",
+            (
+                f"{result.average_intensity:.0f} "
+                "gCO₂/kWh"
+            ),
+        )
+
+        st.metric(
+            "Estimated emissions",
+            (
+                f"{result.scheduled_emissions_g:.1f} "
+                "gCO₂"
+            ),
+            delta=(
+                f"-{result.avoided_emissions_g:.1f} "
+                "gCO₂"
+            ),
+        )
+
+    st.subheader("Why this window was selected")
+
+    st.write(
+        f"The scheduler examined every continuous "
+        f"{result.duration_hours:g}-hour window available "
+        "before the deadline."
+    )
+
+    st.write(
+        f"The selected period has an average forecast carbon "
+        f"intensity of {result.average_intensity:.1f} "
+        "gCO₂/kWh, compared with "
+        f"{result.immediate_average_intensity:.1f} "
+        "gCO₂/kWh when running immediately."
+    )
+
+    st.write(
+        f"At an estimated average power of "
+        f"{power_watts} watts, the workload would consume "
+        f"approximately {result.energy_kwh:.2f} kWh."
+    )
+
+    st.caption(
+        "All carbon and energy results are estimates based on "
+        "the supplied workload power and simulated grid data."
+    )
+
+with st.expander("View forecast data"):
+    display_forecast = forecast.copy()
+
+    display_forecast["timestamp"] = (
+        display_forecast["timestamp"]
+        .dt.strftime("%a %d %b, %H:%M")
+    )
+
+    display_forecast = display_forecast.rename(
+        columns={
+            "timestamp": "Time",
+            "carbon_intensity": (
+                "Carbon intensity (gCO₂/kWh)"
+            ),
+            "renewable_percentage": (
+                "Estimated renewables (%)"
+            ),
+        }
+    )
+
+    st.dataframe(
+        display_forecast,
+        width="stretch",
+        hide_index=True,
+    )
