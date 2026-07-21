@@ -6,7 +6,7 @@ import streamlit as st
 
 from carbon_data import generate_demo_forecast
 from data_loader import load_carbon_csv, select_latest_window
-from scheduler import find_greenest_window
+from scheduler import find_ranked_greenest_windows
 
 
 # -------------------------------------------------------------------
@@ -24,19 +24,19 @@ st.set_page_config(
 # Session state
 # -------------------------------------------------------------------
 
-DEFAULT_SESSION_VALUES = {
+SESSION_DEFAULTS = {
     "schedule_result": None,
     "schedule_inputs": None,
     "schedule_source_signature": None,
 }
 
-for key, default_value in DEFAULT_SESSION_VALUES.items():
+for key, default_value in SESSION_DEFAULTS.items():
     if key not in st.session_state:
         st.session_state[key] = default_value
 
 
 # -------------------------------------------------------------------
-# Data source selection
+# Data-source selection
 # -------------------------------------------------------------------
 
 st.sidebar.header("Data source")
@@ -62,7 +62,7 @@ if selected_source == "EirGrid forecast CSV":
         "Upload an EirGrid CO₂ CSV",
         type=["csv"],
         help=(
-            "Upload the original CSV exported from the "
+            "Upload an original CSV exported from the "
             "EirGrid Smart Grid Dashboard."
         ),
     )
@@ -70,7 +70,7 @@ if selected_source == "EirGrid forecast CSV":
     if uploaded_file is None:
         st.sidebar.info(
             "Upload an EirGrid CSV to use official data. "
-            "Demo data is being used until then."
+            "Demo data is active until then."
         )
 
         forecast = generate_demo_forecast(hours=48)
@@ -127,8 +127,10 @@ else:
 
 
 # -------------------------------------------------------------------
-# Validate and describe the active dataset
+# Validate and describe the dataset
 # -------------------------------------------------------------------
+
+forecast_attributes = forecast.attrs.copy()
 
 forecast = (
     forecast
@@ -136,6 +138,9 @@ forecast = (
     .reset_index(drop=True)
     .copy()
 )
+
+forecast.attrs = forecast_attributes
+
 
 if len(forecast) < 2:
     st.error(
@@ -150,38 +155,56 @@ time_differences = (
     .dropna()
 )
 
-median_interval = time_differences.median()
+interval = time_differences.median()
 
-interval_hours = (
-    median_interval.total_seconds()
-    / 3600
-)
-
-if interval_hours <= 0:
+if not time_differences.eq(interval).all():
     st.error(
-        "The grid-data timestamps are not in a valid order."
+        "The active grid dataset contains missing or irregular "
+        "time intervals."
     )
     st.stop()
 
 
-available_horizon_hours = (
-    len(forecast) * interval_hours
+interval_hours = (
+    interval.total_seconds()
+    / 3600
 )
 
-current_intensity = float(
+interval_minutes = (
+    interval.total_seconds()
+    / 60
+)
+
+if interval_hours <= 0:
+    st.error(
+        "The grid-data interval must be greater than zero."
+    )
+    st.stop()
+
+
+forecast_start = forecast.iloc[0]["timestamp"]
+
+forecast_end = (
+    forecast.iloc[-1]["timestamp"]
+    + interval
+)
+
+available_horizon_hours = (
+    forecast_end - forecast_start
+).total_seconds() / 3600
+
+
+starting_intensity = float(
     forecast.iloc[0]["carbon_intensity"]
 )
-
-first_timestamp = forecast.iloc[0]["timestamp"]
-last_timestamp = forecast.iloc[-1]["timestamp"]
 
 
 source_signature = (
     source_label,
     uploaded_filename,
     len(forecast),
-    str(first_timestamp),
-    str(last_timestamp),
+    str(forecast_start),
+    str(forecast_end),
     round(
         float(
             forecast["carbon_intensity"].sum()
@@ -191,18 +214,20 @@ source_signature = (
 )
 
 
-# Remove a recommendation calculated using a different dataset.
 if (
     st.session_state.schedule_source_signature
     is not None
-    and
-    st.session_state.schedule_source_signature
+    and st.session_state.schedule_source_signature
     != source_signature
 ):
     st.session_state.schedule_result = None
     st.session_state.schedule_inputs = None
     st.session_state.schedule_source_signature = None
 
+
+# -------------------------------------------------------------------
+# Sidebar dataset information
+# -------------------------------------------------------------------
 
 st.sidebar.divider()
 st.sidebar.subheader("Dataset information")
@@ -212,30 +237,25 @@ st.sidebar.write(
 )
 
 st.sidebar.write(
-    f"Interval: **{interval_hours * 60:.0f} minutes**"
+    f"Interval: **{interval_minutes:g} minutes**"
 )
 
 st.sidebar.write(
-    f"Available horizon: "
-    f"**{available_horizon_hours:g} hours**"
+    f"Coverage: **{available_horizon_hours:g} hours**"
 )
 
-st.sidebar.write(
-    "First timestamp:"
-)
+st.sidebar.write("Coverage starts:")
 
 st.sidebar.code(
-    first_timestamp.strftime(
+    forecast_start.strftime(
         "%Y-%m-%d %H:%M %Z"
     )
 )
 
-st.sidebar.write(
-    "Last timestamp:"
-)
+st.sidebar.write("Coverage ends:")
 
 st.sidebar.code(
-    last_timestamp.strftime(
+    forecast_end.strftime(
         "%Y-%m-%d %H:%M %Z"
     )
 )
@@ -252,10 +272,10 @@ st.subheader(
 )
 
 st.info(
-    "Enter the workload duration, completion deadline and "
-    "estimated power consumption. GridShift will evaluate every "
-    "valid continuous execution window and recommend the one with "
-    "the lowest forecast carbon emissions."
+    "Choose when your workload may begin, when it must finish, "
+    "how long it will run and how much power it consumes. "
+    "GridShift evaluates every valid execution window and ranks "
+    "the lowest-carbon options."
 )
 
 
@@ -284,39 +304,72 @@ st.divider()
 
 
 # -------------------------------------------------------------------
-# Workload constraints
+# Scheduling-time options
 # -------------------------------------------------------------------
 
-st.header("Configure your AI workload")
-
-
-maximum_deadline = min(
-    48.0,
-    available_horizon_hours,
+earliest_start_options = (
+    forecast["timestamp"]
+    .tolist()
 )
 
-maximum_duration = min(
-    24.0,
-    maximum_deadline,
-)
+deadline_options = [
+    forecast_start
+    + step_number * interval
+    for step_number in range(
+        1,
+        len(forecast) + 1,
+    )
+]
 
-minimum_step = float(interval_hours)
+
+def format_timestamp(
+    timestamp: pd.Timestamp,
+) -> str:
+    return timestamp.strftime(
+        "%a %d %b, %H:%M"
+    )
+
 
 default_duration = min(
     3.0,
-    maximum_duration,
+    available_horizon_hours,
 )
 
-default_deadline = min(
+default_duration_steps = max(
+    1,
+    round(
+        default_duration
+        / interval_hours
+    ),
+)
+
+default_duration = (
+    default_duration_steps
+    * interval_hours
+)
+
+default_deadline_hours = min(
     18.0,
-    maximum_deadline,
+    available_horizon_hours,
 )
 
-# Ensure the default deadline is not shorter than the duration.
-default_deadline = max(
-    default_deadline,
-    default_duration,
+default_deadline_index = max(
+    default_duration_steps - 1,
+    min(
+        len(deadline_options) - 1,
+        round(
+            default_deadline_hours
+            / interval_hours
+        ) - 1,
+    ),
 )
+
+
+# -------------------------------------------------------------------
+# Workload form
+# -------------------------------------------------------------------
+
+st.header("Configure your AI workload")
 
 widget_suffix = str(
     abs(hash(source_signature))
@@ -331,37 +384,57 @@ with st.form(
         value="Generate product embeddings",
     )
 
-    input_col_1, input_col_2, input_col_3 = (
-        st.columns(3)
+    first_row_col_1, first_row_col_2 = (
+        st.columns(2)
     )
 
-    with input_col_1:
+    with first_row_col_1:
+        earliest_start_time = st.selectbox(
+            "Earliest allowed start",
+            options=earliest_start_options,
+            index=0,
+            format_func=format_timestamp,
+            help=(
+                "GridShift will not schedule the workload "
+                "before this time."
+            ),
+        )
+
+    with first_row_col_2:
+        deadline_time = st.selectbox(
+            "Completion deadline",
+            options=deadline_options,
+            index=default_deadline_index,
+            format_func=format_timestamp,
+            help=(
+                "The workload must finish at or before "
+                "this timestamp."
+            ),
+        )
+
+    second_row_col_1, second_row_col_2 = (
+        st.columns(2)
+    )
+
+    with second_row_col_1:
         duration_hours = st.number_input(
             "Workload duration (hours)",
-            min_value=minimum_step,
-            max_value=float(maximum_duration),
+            min_value=float(interval_hours),
+            max_value=float(
+                min(
+                    24.0,
+                    available_horizon_hours,
+                )
+            ),
             value=float(default_duration),
-            step=minimum_step,
+            step=float(interval_hours),
             help=(
-                "The continuous amount of time required by "
-                "the workload."
+                "The workload runs continuously for this "
+                "amount of time."
             ),
         )
 
-    with input_col_2:
-        deadline_hours = st.number_input(
-            "Must finish within (hours)",
-            min_value=minimum_step,
-            max_value=float(maximum_deadline),
-            value=float(default_deadline),
-            step=minimum_step,
-            help=(
-                "The workload must finish within this many "
-                "hours from the beginning of the dataset."
-            ),
-        )
-
-    with input_col_3:
+    with second_row_col_2:
         power_watts = st.number_input(
             "Average workload power (watts)",
             min_value=10,
@@ -376,26 +449,48 @@ with st.form(
 
     st.caption(
         f"The active dataset uses "
-        f"{interval_hours * 60:.0f}-minute scheduling intervals."
+        f"{interval_minutes:g}-minute scheduling intervals."
     )
 
     submitted = st.form_submit_button(
-        "Calculate greenest schedule",
+        "Find greenest schedules",
         type="primary",
     )
 
 
 # -------------------------------------------------------------------
-# Run the scheduling algorithm
+# Run Scheduler V2
 # -------------------------------------------------------------------
 
 if submitted:
+    earliest_start_hours = (
+        earliest_start_time
+        - forecast_start
+    ).total_seconds() / 3600
+
+    deadline_hours = (
+        deadline_time
+        - forecast_start
+    ).total_seconds() / 3600
+
     try:
-        calculated_result = find_greenest_window(
-            forecast=forecast,
-            duration_hours=float(duration_hours),
-            deadline_hours=float(deadline_hours),
-            power_watts=float(power_watts),
+        calculated_result = (
+            find_ranked_greenest_windows(
+                forecast=forecast,
+                duration_hours=float(
+                    duration_hours
+                ),
+                earliest_start_hours=float(
+                    earliest_start_hours
+                ),
+                deadline_hours=float(
+                    deadline_hours
+                ),
+                power_watts=float(
+                    power_watts
+                ),
+                top_n=4,
+            )
         )
 
         st.session_state.schedule_result = (
@@ -409,6 +504,13 @@ if submitted:
             ),
             "requested_duration_hours": float(
                 duration_hours
+            ),
+            "earliest_start_time": (
+                earliest_start_time
+            ),
+            "deadline_time": deadline_time,
+            "earliest_start_hours": float(
+                earliest_start_hours
             ),
             "deadline_hours": float(
                 deadline_hours
@@ -447,26 +549,26 @@ overview_col_1, overview_col_2, overview_col_3 = (
 
 
 if is_historical_replay:
-    intensity_metric_label = (
+    intensity_label = (
         "Replay starting intensity"
     )
 
 elif is_official_forecast:
-    intensity_metric_label = (
+    intensity_label = (
         "Forecast starting intensity"
     )
 
 else:
-    intensity_metric_label = (
+    intensity_label = (
         "Current simulated intensity"
     )
 
 
 with overview_col_1:
     st.metric(
-        label=intensity_metric_label,
+        label=intensity_label,
         value=(
-            f"{current_intensity:.0f} "
+            f"{starting_intensity:.0f} "
             "gCO₂/kWh"
         ),
     )
@@ -497,7 +599,7 @@ with overview_col_3:
 
 
 # -------------------------------------------------------------------
-# Grid-data chart
+# Forecast chart
 # -------------------------------------------------------------------
 
 st.divider()
@@ -542,7 +644,7 @@ if result is not None:
         x1=result.end_time,
         opacity=0.22,
         line_width=1,
-        annotation_text="Recommended window",
+        annotation_text="Best window",
         annotation_position="top left",
     )
 
@@ -567,7 +669,7 @@ if result is not None:
         marker={
             "size": 11,
         },
-        name="Scheduled workload",
+        name="Best schedule",
     )
 
 
@@ -597,7 +699,7 @@ st.plotly_chart(
 
 if result is not None and saved_inputs is not None:
     st.divider()
-    st.header("Recommended schedule")
+    st.header("Best schedule")
 
     workload_display_name = saved_inputs[
         "workload_name"
@@ -611,18 +713,13 @@ if result is not None and saved_inputs is not None:
     )
 
 
-    baseline_title = (
-        "Replay starting window"
-        if is_historical_replay
-        else "Run at the first available time"
+    summary_col_1, summary_col_2 = (
+        st.columns(2)
     )
 
 
-    immediate_col, scheduled_col = st.columns(2)
-
-
-    with immediate_col:
-        st.subheader(baseline_title)
+    with summary_col_1:
+        st.subheader("First valid window")
 
         st.metric(
             "Average carbon intensity",
@@ -641,8 +738,8 @@ if result is not None and saved_inputs is not None:
         )
 
 
-    with scheduled_col:
-        st.subheader("GridShift schedule")
+    with summary_col_2:
+        st.subheader("GridShift recommendation")
 
         st.metric(
             "Average carbon intensity",
@@ -658,11 +755,6 @@ if result is not None and saved_inputs is not None:
                 f"{result.scheduled_emissions_g:.1f} "
                 "gCO₂"
             ),
-            delta=(
-                f"-{result.avoided_emissions_g:.1f} "
-                "gCO₂"
-            ),
-            delta_color="inverse",
         )
 
 
@@ -690,67 +782,111 @@ if result is not None and saved_inputs is not None:
 
     with impact_col_3:
         st.metric(
-            "Scheduled duration",
-            f"{result.duration_hours:g} hours",
+            "Candidate windows evaluated",
+            f"{result.candidate_count}",
+        )
+
+
+    if result.has_carbon_benefit:
+        st.success(
+            f"Delaying this workload to the recommended period "
+            f"could reduce estimated operational emissions by "
+            f"{result.reduction_percentage:.1f}%."
+        )
+
+    else:
+        st.info(
+            "The first valid execution window is already the "
+            "lowest-carbon option. GridShift recommends running "
+            "the workload without an additional delay."
         )
 
 
     st.subheader("Why this window was selected")
 
     st.write(
-        f"GridShift evaluated every continuous "
-        f"{result.duration_hours:g}-hour window available "
-        f"before the "
-        f"{saved_inputs['deadline_hours']:g}-hour deadline."
+        f"GridShift evaluated "
+        f"{result.candidate_count} valid continuous windows "
+        f"between "
+        f"{saved_inputs['earliest_start_time'].strftime('%H:%M')} "
+        f"and the "
+        f"{saved_inputs['deadline_time'].strftime('%H:%M')} "
+        f"completion deadline."
     )
 
     st.write(
-        f"The recommended window has an average carbon "
-        f"intensity of {result.average_intensity:.1f} "
-        f"gCO₂/kWh. The first available execution window "
-        f"has an average intensity of "
+        f"The selected window averages "
+        f"{result.average_intensity:.1f} gCO₂/kWh. "
+        f"The first valid window averages "
         f"{result.immediate_average_intensity:.1f} "
         f"gCO₂/kWh."
     )
 
     st.write(
-        f"At an estimated average power consumption of "
+        f"At an estimated average power of "
         f"{saved_inputs['power_watts']:.0f} watts, "
-        f"the workload would consume approximately "
+        f"the workload consumes approximately "
         f"{result.energy_kwh:.2f} kWh."
     )
 
 
-    if result.avoided_emissions_g > 0:
-        st.write(
-            f"Scheduling the workload in the recommended window "
-            f"could avoid approximately "
-            f"{result.avoided_emissions_g:.1f} grams of CO₂, "
-            f"an estimated reduction of "
-            f"{result.reduction_percentage:.1f}%."
+    # ---------------------------------------------------------------
+    # Alternative schedules
+    # ---------------------------------------------------------------
+
+    st.subheader("Alternative schedules")
+
+    if result.alternatives:
+        alternative_rows = []
+
+        for option in result.alternatives:
+            alternative_rows.append(
+                {
+                    "Rank": option.rank,
+                    "Start": option.start_time.strftime(
+                        "%a %H:%M"
+                    ),
+                    "End": option.end_time.strftime(
+                        "%a %H:%M"
+                    ),
+                    "Average intensity": (
+                        f"{option.average_intensity:.1f} "
+                        "gCO₂/kWh"
+                    ),
+                    "Estimated emissions": (
+                        f"{option.emissions_g:.1f} "
+                        "gCO₂"
+                    ),
+                    "Reduction": (
+                        f"{option.reduction_percentage:.1f}%"
+                    ),
+                }
+            )
+
+        alternatives_table = pd.DataFrame(
+            alternative_rows
         )
 
-    elif result.avoided_emissions_g == 0:
-        st.write(
-            "The scheduler found no carbon advantage over "
-            "the first available execution window."
+        st.dataframe(
+            alternatives_table,
+            width="stretch",
+            hide_index=True,
         )
 
     else:
-        st.warning(
-            "No cleaner valid window was available before "
-            "the selected deadline."
+        st.info(
+            "No additional valid execution windows were available."
         )
 
 
     st.caption(
         "Energy and carbon figures are estimates based on the "
-        "provided power value and the active grid dataset."
+        "provided power value and active grid dataset."
     )
 
 
 # -------------------------------------------------------------------
-# Raw grid-data table
+# Raw data
 # -------------------------------------------------------------------
 
 with st.expander("View grid data"):
