@@ -12,3 +12,7 @@ data_loader.py.backup
 data/*.db
 data/*.db-shm
 data/*.db-wal
+*.backup
+data/*.db
+data/*.db-shm
+data/*.db-wal
